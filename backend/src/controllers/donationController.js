@@ -1,320 +1,144 @@
 const Donation = require("../models/Donation");
-const NGO = require("../models/NGO");
+const NGO      = require("../models/NGO");
 const Campaign = require("../models/Campaign");
 
-// 📝 Create Donation (Donor only)
+async function getNGOProfile(userId, res) {
+  const ngoProfile = await NGO.findOne({ user: userId });
+  if (!ngoProfile) {
+    res.status(400).json({ success: false, message: "NGO profile not found. Please create your NGO profile first." });
+    return null;
+  }
+  return ngoProfile;
+}
+
 exports.createDonation = async (req, res) => {
   try {
-    const { title, description, type, quantity, amount, pickupAddress } = req.body;
+    const { title, description, type, quantity, amount, pickupAddress, scheduledPickupDate, campaignId } = req.body;
 
-    if (req.user.role !== "donor") {
-      return res.status(403).json({
-        success: false,
-        message: "Only donors can create donations",
-      });
+    if (!title || !description || !type)
+      return res.status(400).json({ success: false, message: "Title, description, and type are required" });
+
+    if (!["item", "money"].includes(type))
+      return res.status(400).json({ success: false, message: "Type must be 'item' or 'money'" });
+
+    if (type === "item" && !pickupAddress)
+      return res.status(400).json({ success: false, message: "Pickup address is required for item donations" });
+
+    if (type === "money" && (!amount || Number(amount) <= 0))
+      return res.status(400).json({ success: false, message: "A valid amount greater than 0 is required for money donations" });
+
+    let campaign = null;
+    if (campaignId) {
+      campaign = await Campaign.findById(campaignId);
+      if (!campaign) return res.status(404).json({ success: false, message: "Campaign not found" });
+      if (!campaign.isActive) return res.status(400).json({ success: false, message: "Cannot donate to an inactive campaign" });
     }
 
-    if (!title || !description || !type) {
-      return res.status(400).json({
-        success: false,
-        message: "Title, description, and type are required",
-      });
-    }
-
-    if (type === "item" && !pickupAddress) {
-      return res.status(400).json({
-        success: false,
-        message: "Pickup address is required for item donations",
-      });
-    }
-
-    if (type === "money" && (!amount || amount <= 0)) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid amount is required for money donations",
-      });
-    }
-
-    // 🆕 FIND OR CREATE CAMPAIGN
-    let campaign = await Campaign.findOne({ title });
-
-    if (!campaign) {
-      campaign = await Campaign.create({
-        title,
-        description,
-        goalAmount: 50000,
-        createdBy: req.user._id,
-      });
-    }
-
-    // 🆕 ATTACH CAMPAIGN TO DONATION
     const donation = await Donation.create({
-      title,
-      description,
-      type,
-      quantity,
-      amount,
-      pickupAddress,
+      title, description, type,
+      quantity: type === "item" ? (quantity || 1) : 0,
+      amount:   type === "money" ? Number(amount) : 0,
+      pickupAddress: type === "item" ? pickupAddress : undefined,
+      scheduledPickupDate: scheduledPickupDate || undefined,
       donor: req.user._id,
-      campaign: campaign._id,
+      campaign: campaign?._id || null,
     });
 
-    res.status(201).json({
-      success: true,
-      message: "Donation created successfully",
-      data: donation,
-    });
+    res.status(201).json({ success: true, message: "Donation created successfully", data: donation });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to create donation",
-      error: error.message,
-    });
+    console.error("Create donation error:", error.message);
+    res.status(500).json({ success: false, message: "Failed to create donation" });
   }
 };
 
-// 📥 Get All Donations (Role-based)
 exports.getDonations = async (req, res) => {
   try {
     let filter = {};
-
     if (req.user.role === "donor") {
       filter.donor = req.user._id;
-    }
-
-    if (req.user.role === "ngo") {
-      const ngoProfile = await NGO.findOne({ user: req.user._id });
-
-      if (!ngoProfile) {
-        return res.status(400).json({
-          success: false,
-          message: "NGO profile not found",
-        });
-      }
-
-      filter = {
-        $or: [
-          { status: "pending" },
-          { ngo: ngoProfile._id },
-        ],
-      };
+    } else if (req.user.role === "ngo") {
+      const ngoProfile = await getNGOProfile(req.user._id, res);
+      if (!ngoProfile) return;
+      filter = { $or: [{ status: "pending" }, { ngo: ngoProfile._id }] };
     }
 
     const donations = await Donation.find(filter)
       .populate("donor", "name email")
-      .populate("ngo");
+      .populate("ngo", "name")
+      .populate("campaign", "title goalAmount")
+      .sort({ createdAt: -1 });
 
-    res.status(200).json({
-      success: true,
-      count: donations.length,
-      data: donations,
-    });
+    res.status(200).json({ success: true, count: donations.length, data: donations });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch donations",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Failed to fetch donations" });
   }
 };
 
-
-exports.updateDonationStatus = async (req, res) => {
-  try {
-    const { status, rejectionReason } = req.body;
-
-    const donation = await Donation.findById(req.params.id);
-
-    if (!donation) {
-      return res.status(404).json({
-        success: false,
-        message: "Donation not found",
-      });
-    }
-
-    // ✅ Only NGO can update
-    if (req.user.role !== "ngo") {
-      return res.status(403).json({
-        success: false,
-        message: "Only NGOs can update donation status",
-      });
-    }
-
-    // 🔑 Get NGO profile
-    const ngoProfile = await NGO.findOne({ user: req.user._id });
-
-    if (!ngoProfile) {
-      return res.status(400).json({
-        success: false,
-        message: "NGO profile not found",
-      });
-    }
-
-    // =========================
-    // ✅ ACCEPT LOGIC
-    // =========================
-    if (status === "accepted") {
-      if (!ngoProfile.isVerified) {
-        return res.status(403).json({
-          success: false,
-          message: "Only verified NGOs can accept donations",
-        });
-      }
-
-      if (!donation.canTransitionTo("accepted")) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid transition from ${donation.status} to accepted`,
-        });
-      }
-
-      if (
-        donation.ngo &&
-        donation.ngo.toString() !== ngoProfile._id.toString()
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Donation already accepted by another NGO",
-        });
-      }
-
-      donation.ngo = ngoProfile._id;
-      donation.status = "accepted";
-    }
-
-    // =========================
-    // ❌ REJECTION LOGIC (NEW)
-    // =========================
-    else if (status === "rejected") {
-      // Only reject if still pending
-      if (donation.status !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: "Only pending donations can be rejected",
-        });
-      }
-
-      // If already accepted by someone → cannot reject
-      if (donation.ngo) {
-        return res.status(400).json({
-          success: false,
-          message: "Cannot reject an already accepted donation",
-        });
-      }
-
-      donation.status = "rejected";
-
-      // Optional: store reason (if you add field in schema)
-      if (rejectionReason) {
-        donation.rejectionReason = rejectionReason;
-      }
-    }
-
-    // =========================
-    // ✅ COMPLETE LOGIC
-    // =========================
-    else if (status === "completed") {
-      if (!donation.canTransitionTo("completed")) {
-        return res.status(400).json({
-          success: false,
-          message: `Invalid transition from ${donation.status} to completed`,
-        });
-      }
-
-      // Only same NGO can complete
-      if (
-        !donation.ngo ||
-        donation.ngo.toString() !== ngoProfile._id.toString()
-      ) {
-        return res.status(403).json({
-          success: false,
-          message: "Only assigned NGO can complete this donation",
-        });
-      }
-
-      donation.status = "completed";
-    }
-
-    // =========================
-    // ❌ INVALID STATUS
-    // =========================
-    else {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status value",
-      });
-    }
-
-    await donation.save();
-
-    res.status(200).json({
-      success: true,
-      message: "Donation status updated successfully",
-      data: donation,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to update donation status",
-      error: error.message,
-    });
-  }
-};
-
-// 📄 Get Single Donation
 exports.getDonationById = async (req, res) => {
   try {
     const donation = await Donation.findById(req.params.id)
       .populate("donor", "name email")
-      .populate("ngo");
+      .populate("ngo", "name contactNumber")
+      .populate("campaign", "title goalAmount");
 
-    if (!donation) {
-      return res.status(404).json({
-        success: false,
-        message: "Donation not found",
-      });
-    }
+    if (!donation) return res.status(404).json({ success: false, message: "Donation not found" });
 
-    if (
-      req.user.role === "donor" &&
-      donation.donor.toString() !== req.user._id.toString()
-    ) {
-      return res.status(403).json({
-        success: false,
-        message: "Access denied",
-      });
-    }
+    if (req.user.role === "donor" && donation.donor._id.toString() !== req.user._id.toString())
+      return res.status(403).json({ success: false, message: "Access denied" });
 
     if (req.user.role === "ngo") {
-      const ngoProfile = await NGO.findOne({ user: req.user._id });
-
-      if (!ngoProfile) {
-        return res.status(400).json({
-          success: false,
-          message: "NGO profile not found",
-        });
-      }
-
-      if (
-        donation.ngo &&
-        donation.ngo.toString() !== ngoProfile._id.toString()
-      ) {
-        return res.status(403).json({
-          success: false,
-          message: "Access denied",
-        });
-      }
+      const ngoProfile = await getNGOProfile(req.user._id, res);
+      if (!ngoProfile) return;
+      const isAssigned = donation.ngo?._id?.toString() === ngoProfile._id.toString();
+      if (!isAssigned && donation.status !== "pending")
+        return res.status(403).json({ success: false, message: "Access denied" });
     }
 
-    res.status(200).json({
-      success: true,
-      data: donation,
-    });
+    res.status(200).json({ success: true, data: donation });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch donation",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Failed to fetch donation" });
+  }
+};
+
+exports.updateDonationStatus = async (req, res) => {
+  try {
+    const { status, rejectionReason, ngoNote } = req.body;
+    const donation = await Donation.findById(req.params.id);
+    if (!donation) return res.status(404).json({ success: false, message: "Donation not found" });
+
+    const ngoProfile = await getNGOProfile(req.user._id, res);
+    if (!ngoProfile) return;
+
+    if (status === "accepted") {
+      if (!ngoProfile.isVerified)
+        return res.status(403).json({ success: false, message: "Only verified NGOs can accept donations" });
+      if (!donation.canTransitionTo("accepted"))
+        return res.status(400).json({ success: false, message: `Cannot move from '${donation.status}' to 'accepted'` });
+      if (donation.ngo && donation.ngo.toString() !== ngoProfile._id.toString())
+        return res.status(400).json({ success: false, message: "This donation has already been accepted by another NGO" });
+      donation.ngo = ngoProfile._id;
+      donation.status = "accepted";
+      if (ngoNote) donation.ngoNote = ngoNote;
+    } else if (status === "rejected") {
+      if (donation.status !== "pending")
+        return res.status(400).json({ success: false, message: "Only pending donations can be rejected" });
+      if (donation.ngo)
+        return res.status(400).json({ success: false, message: "Cannot reject an already-accepted donation" });
+      donation.status = "rejected";
+      donation.rejectionReason = rejectionReason || "";
+    } else if (status === "completed") {
+      if (!donation.canTransitionTo("completed"))
+        return res.status(400).json({ success: false, message: `Cannot move from '${donation.status}' to 'completed'` });
+      if (!donation.ngo || donation.ngo.toString() !== ngoProfile._id.toString())
+        return res.status(403).json({ success: false, message: "Only the assigned NGO can mark this donation as completed" });
+      donation.status = "completed";
+    } else {
+      return res.status(400).json({ success: false, message: "Invalid status. Must be: accepted, rejected, or completed" });
+    }
+
+    await donation.save();
+    res.status(200).json({ success: true, message: `Donation ${status} successfully`, data: donation });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to update donation status" });
   }
 };

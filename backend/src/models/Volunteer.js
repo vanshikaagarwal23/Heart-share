@@ -6,30 +6,31 @@ const volunteerSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
-      unique: true,
     },
-
-    campaigns: [
-      {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "Campaign",
-      },
-    ],
-
+    campaign: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Campaign",
+      required: true,
+    },
+    status: {
+      type: String,
+      enum: ["pending", "approved", "rejected"],
+      default: "pending",
+    },
     hours: {
       type: Number,
       default: 0,
+      min: [0, "Hours cannot be negative"],
     },
-
-    status: {
+    note: {
       type: String,
-      enum: ["Active", "On Leave", "Inactive"],
-      default: "Active",
+      trim: true,
+      default: "",
     },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
+
+volunteerSchema.index({ user: 1, campaign: 1 }, { unique: true });
 
 module.exports = mongoose.model("Volunteer", volunteerSchema);

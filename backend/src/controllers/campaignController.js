@@ -1,86 +1,63 @@
-const Campaign = require("../models/Campaign");
-const Donation = require("../models/Donation");
+const Campaign  = require("../models/Campaign");
+const mongoose  = require("mongoose");
 
 exports.getCampaigns = async (req, res) => {
   try {
-    const campaigns = await Campaign.find();
-
-    const enriched = await Promise.all(
-      campaigns.map(async (c) => {
-        const donations = await Donation.find({ campaign: c._id });
-
-        const total = donations.reduce((sum, d) => sum + (d.amount || 0), 0);
-
-        return {
-          ...c.toObject(),
-          raised: total,
-          donationsCount: donations.length,
-        };
-      })
-    );
-
-    res.status(200).json({
-      success: true,
-      data: enriched,
-    });
+    const campaigns = await Campaign.aggregate([
+      { $lookup: { from: "donations", localField: "_id", foreignField: "campaign", as: "donations" } },
+      { $addFields: { raised: { $sum: "$donations.amount" }, donationsCount: { $size: "$donations" } } },
+      { $project: { donations: 0 } },
+      { $sort: { createdAt: -1 } },
+    ]);
+    res.status(200).json({ success: true, count: campaigns.length, data: campaigns });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch campaigns",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Failed to fetch campaigns" });
   }
 };
 
 exports.getCampaignById = async (req, res) => {
   try {
-    const campaign = await Campaign.findById(req.params.id);
-
-    if (!campaign) {
-      return res.status(404).json({
-        success: false,
-        message: "Campaign not found",
-      });
-    }
-
-    const donations = await Donation.find({ campaign: campaign._id });
-
-    res.status(200).json({
-      success: true,
-      data: {
-        campaign,
-        donations,
-      },
-    });
+    const [result] = await Campaign.aggregate([
+      { $match: { _id: new mongoose.Types.ObjectId(req.params.id) } },
+      { $lookup: { from: "donations", localField: "_id", foreignField: "campaign", as: "donations" } },
+      { $addFields: { raised: { $sum: "$donations.amount" }, donationsCount: { $size: "$donations" } } },
+      { $project: { donations: 0 } },
+    ]);
+    if (!result) return res.status(404).json({ success: false, message: "Campaign not found" });
+    res.status(200).json({ success: true, data: result });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to fetch campaign",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, message: "Failed to fetch campaign" });
   }
 };
 
 exports.createCampaign = async (req, res) => {
   try {
     const { title, description, goalAmount } = req.body;
+    if (!title || title.trim().length < 3)
+      return res.status(400).json({ success: false, message: "Campaign title must be at least 3 characters" });
+    if (!description || description.trim().length < 10)
+      return res.status(400).json({ success: false, message: "Campaign description must be at least 10 characters" });
+    if (!goalAmount || Number(goalAmount) < 1)
+      return res.status(400).json({ success: false, message: "Goal amount must be greater than 0" });
 
-    const campaign = await Campaign.create({
-      title,
-      description,
-      goalAmount,
-      createdBy: req.user._id,
-    });
-
-    res.status(201).json({
-      success: true,
-      data: campaign,
-    });
+    const campaign = await Campaign.create({ title: title.trim(), description: description.trim(), goalAmount: Number(goalAmount), createdBy: req.user._id });
+    res.status(201).json({ success: true, message: "Campaign created successfully", data: { ...campaign.toObject(), raised: 0, donationsCount: 0 } });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Failed to create campaign",
-      error: error.message,
-    });
+    if (error.code === 11000) return res.status(400).json({ success: false, message: "A campaign with this title already exists" });
+    res.status(500).json({ success: false, message: "Failed to create campaign" });
+  }
+};
+
+exports.toggleCampaign = async (req, res) => {
+  try {
+    const campaign = await Campaign.findById(req.params.id);
+    if (!campaign) return res.status(404).json({ success: false, message: "Campaign not found" });
+    if (campaign.createdBy.toString() !== req.user._id.toString())
+      return res.status(403).json({ success: false, message: "Not authorized" });
+    campaign.isActive = !campaign.isActive;
+    await campaign.save();
+    res.status(200).json({ success: true, message: `Campaign ${campaign.isActive ? "activated" : "deactivated"}`, data: campaign });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to update campaign" });
   }
 };
